@@ -189,9 +189,26 @@ export class OverlayManager extends EventEmitter {
     }
     for (const d of displays) {
       const win = this.windows.get(d.id);
-      if (win) win.setBounds(d.bounds);
+      if (win) {
+        win.setBounds(d.bounds);
+        this.setWindowShape(win, d);
+      }
       else this.windows.set(d.id, this.createWindow(d));
     }
+  }
+
+  /** Keep the Windows overlay out of the taskbar's reserved area. */
+  private setWindowShape(win: BrowserWindow, d: Display): void {
+    if (IS_MAC) return;
+    const region = {
+      x: d.workArea.x - d.bounds.x,
+      y: d.workArea.y - d.bounds.y,
+      width: d.workArea.width,
+      height: d.workArea.height,
+    };
+    const coversDisplay = region.x === 0 && region.y === 0
+      && region.width === d.bounds.width && region.height === d.bounds.height;
+    win.setShape(coversDisplay ? [] : [region]);
   }
 
   private createWindow(d: Display): BrowserWindow {
@@ -221,11 +238,13 @@ export class OverlayManager extends EventEmitter {
     });
     win.setIgnoreMouseEvents(true);
     win.setAlwaysOnTop(true, 'screen-saver');
+    this.setWindowShape(win, d);
     if (IS_MAC) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
     win.webContents.on('did-finish-load', () => win.webContents.send('overlay:settings', this.settings));
     win.once('ready-to-show', () => {
       win.showInactive();
       win.setBounds(d.bounds); // re-apply: mixed-DPI setups can size the first frame wrong
+      this.setWindowShape(win, d);
     });
     void loadPage(win, 'overlay');
     return win;

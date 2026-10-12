@@ -4,8 +4,20 @@ import { OVERLAY_EMOTED, OVERLAY_PINGED } from '../../src/shared/ipc';
 import { DEFAULT_SETTINGS, overlaySettings } from '../../src/shared/settings';
 
 const h = vi.hoisted(() => ({
-  windows: [] as Array<{ x: number; webContents: { send: ReturnType<typeof vi.fn> } }>,
+  windows: [] as Array<{
+    x: number;
+    shapeCalls: Array<Array<{ x: number; y: number; width: number; height: number }>>;
+    boundsCalls: Array<{ x: number; y: number; width: number; height: number }>;
+    webContents: { send: ReturnType<typeof vi.fn> };
+  }>,
   handlers: new Map<string, (event: unknown, raw: unknown) => void>(),
+  displays: [] as Array<{
+    id: number;
+    bounds: { x: number; y: number; width: number; height: number };
+    workArea: { x: number; y: number; width: number; height: number };
+    scaleFactor: number;
+  }>,
+  screen: null as { emit: (event: string, ...args: unknown[]) => boolean } | null,
 }));
 
 vi.mock('electron', async () => {
@@ -16,14 +28,21 @@ vi.mock('electron', async () => {
     }
     x: number;
     webContents = Object.assign(new Emitter(), { send: vi.fn() });
+    shapeCalls: Array<Array<{ x: number; y: number; width: number; height: number }>> = [];
+    boundsCalls: Array<{ x: number; y: number; width: number; height: number }> = [];
     constructor(opts: { x: number }) {
       super();
       this.x = opts.x;
-      h.windows.push(this);
+      h.windows.push(this as unknown as (typeof h.windows)[number]);
     }
     setIgnoreMouseEvents(): void {}
     setAlwaysOnTop(): void {}
-    setBounds(): void {}
+    setBounds(rect: { x: number; y: number; width: number; height: number }): void {
+      this.boundsCalls.push(rect);
+    }
+    setShape(rects: Array<{ x: number; y: number; width: number; height: number }>): void {
+      this.shapeCalls.push(rects);
+    }
     showInactive(): void {}
     isDestroyed(): boolean {
       return false;
@@ -31,14 +50,26 @@ vi.mock('electron', async () => {
     destroy(): void {}
   }
   const displays = [
-    { id: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 }, scaleFactor: 1 },
-    { id: 2, bounds: { x: 1920, y: 0, width: 1280, height: 1024 }, scaleFactor: 1 },
+    {
+      id: 1,
+      bounds: { x: 0, y: 0, width: 1920, height: 1080 },
+      workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+      scaleFactor: 1,
+    },
+    {
+      id: 2,
+      bounds: { x: 1920, y: 0, width: 1280, height: 1024 },
+      workArea: { x: 1940, y: 0, width: 1260, height: 1024 },
+      scaleFactor: 1,
+    },
   ];
   const screen = Object.assign(new Emitter(), {
     getAllDisplays: () => displays,
     getPrimaryDisplay: () => displays[0],
     dipToScreenRect: (_win: unknown, r: unknown) => r,
   });
+  h.displays = displays;
+  h.screen = screen;
   const ipcMain = { on: (channel: string, fn: (event: unknown, raw: unknown) => void) => h.handlers.set(channel, fn) };
   return { BrowserWindow: FakeWindow, ipcMain, screen };
 });
@@ -89,6 +120,24 @@ describe('OverlayManager wheels', () => {
       ['wheel:open', { x: 5, y: 5, wheel: 'ping' }],
       ['wheel:move', { x: 6, y: 6, wheel: 'ping' }],
     ]);
+  });
+});
+
+describe('OverlayManager taskbar clipping', () => {
+  it('limits each Windows overlay to its display work area', () => {
+    expect(h.windows[0].shapeCalls.at(-1)).toEqual([{ x: 0, y: 0, width: 1920, height: 1040 }]);
+    expect(h.windows[1].shapeCalls.at(-1)).toEqual([{ x: 20, y: 0, width: 1260, height: 1024 }]);
+  });
+
+  it('updates the shape when a display work area changes', () => {
+    h.displays[0].workArea = { x: 0, y: 0, width: 1920, height: 1032 };
+    h.screen?.emit('display-metrics-changed', {}, ['workArea']);
+    expect(h.windows[0].shapeCalls.at(-1)).toEqual([{ x: 0, y: 0, width: 1920, height: 1032 }]);
+    expect(h.windows[0].boundsCalls.at(-1)).toEqual(h.displays[0].bounds);
+
+    h.displays[0].workArea = h.displays[0].bounds;
+    h.screen?.emit('display-metrics-changed', {}, ['workArea']);
+    expect(h.windows[0].shapeCalls.at(-1)).toEqual([]);
   });
 });
 
