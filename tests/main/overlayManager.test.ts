@@ -6,7 +6,7 @@ import { DEFAULT_SETTINGS, overlaySettings } from '../../src/shared/settings';
 const h = vi.hoisted(() => ({
   windows: [] as Array<{
     x: number;
-    shapeCalls: Array<Array<{ x: number; y: number; width: number; height: number }>>;
+    creationBounds: { x: number; y: number; width: number; height: number };
     boundsCalls: Array<{ x: number; y: number; width: number; height: number }>;
     webContents: { send: ReturnType<typeof vi.fn> };
   }>,
@@ -27,21 +27,19 @@ vi.mock('electron', async () => {
       return (h.windows as unknown as FakeWindow[]).find((w) => w.webContents === wc) ?? null;
     }
     x: number;
+    creationBounds: { x: number; y: number; width: number; height: number };
     webContents = Object.assign(new Emitter(), { send: vi.fn() });
-    shapeCalls: Array<Array<{ x: number; y: number; width: number; height: number }>> = [];
     boundsCalls: Array<{ x: number; y: number; width: number; height: number }> = [];
-    constructor(opts: { x: number }) {
+    constructor(opts: { x: number; y: number; width: number; height: number }) {
       super();
       this.x = opts.x;
+      this.creationBounds = opts;
       h.windows.push(this as unknown as (typeof h.windows)[number]);
     }
     setIgnoreMouseEvents(): void {}
     setAlwaysOnTop(): void {}
     setBounds(rect: { x: number; y: number; width: number; height: number }): void {
       this.boundsCalls.push(rect);
-    }
-    setShape(rects: Array<{ x: number; y: number; width: number; height: number }>): void {
-      this.shapeCalls.push(rects);
     }
     showInactive(): void {}
     isDestroyed(): boolean {
@@ -123,21 +121,20 @@ describe('OverlayManager wheels', () => {
   });
 });
 
-describe('OverlayManager taskbar clipping', () => {
-  it('limits each Windows overlay to its display work area', () => {
-    expect(h.windows[0].shapeCalls.at(-1)).toEqual([{ x: 0, y: 0, width: 1920, height: 1040 }]);
-    expect(h.windows[1].shapeCalls.at(-1)).toEqual([{ x: 20, y: 0, width: 1260, height: 1024 }]);
+describe('OverlayManager work-area windows', () => {
+  it('creates each Windows overlay inside its display work area', () => {
+    expect(h.windows[0].creationBounds).toEqual({ x: 0, y: 0, width: 1920, height: 1038 });
+    expect(h.windows[1].creationBounds).toEqual({ x: 1942, y: 0, width: 1258, height: 1024 });
   });
 
-  it('updates the shape when a display work area changes', () => {
+  it('updates the window bounds when a display work area changes', () => {
     h.displays[0].workArea = { x: 0, y: 0, width: 1920, height: 1032 };
     h.screen?.emit('display-metrics-changed', {}, ['workArea']);
-    expect(h.windows[0].shapeCalls.at(-1)).toEqual([{ x: 0, y: 0, width: 1920, height: 1032 }]);
-    expect(h.windows[0].boundsCalls.at(-1)).toEqual(h.displays[0].bounds);
+    expect(h.windows[0].boundsCalls.at(-1)).toEqual({ x: 0, y: 0, width: 1920, height: 1030 });
 
     h.displays[0].workArea = h.displays[0].bounds;
     h.screen?.emit('display-metrics-changed', {}, ['workArea']);
-    expect(h.windows[0].shapeCalls.at(-1)).toEqual([]);
+    expect(h.windows[0].boundsCalls.at(-1)).toEqual(h.displays[0].bounds);
   });
 });
 
@@ -147,7 +144,7 @@ describe('OverlayManager emote clicks', () => {
     mgr.on('sharedEmote', shared);
     mgr.on('shared', shared);
     mgr.handle({ type: 'click', x: 1920 + 300, y: 400, wheel: 'emote' });
-    expect(sent(1)).toEqual([['emote:spawn', { owner: 'self', art: art('okay', false), x: 300, y: 400 }]]);
+    expect(sent(1)).toEqual([['emote:spawn', { owner: 'self', art: art('okay', false), x: 278, y: 400 }]]);
     expect(sent(0)).toEqual([['emote:clear', { owner: 'self' }]]);
     expect(resolveArt).toHaveBeenCalledWith('okay', false);
     expect(shared).toHaveBeenCalledOnce();
@@ -174,7 +171,7 @@ describe('OverlayManager emote reports from the overlay', () => {
     const shared = vi.fn();
     mgr.on('sharedEmote', shared);
     h.handlers.get(OVERLAY_EMOTED)!({ sender: sender(1) }, { ref: 'c:' + 'a'.repeat(32), x: 10, y: 20 });
-    expect(shared).toHaveBeenCalledWith({ ref: 'c:' + 'a'.repeat(32), displayId: 2, x: 10, y: 20 });
+    expect(shared).toHaveBeenCalledWith({ ref: 'c:' + 'a'.repeat(32), displayId: 2, x: 32, y: 20 });
     expect(sent(0)).toEqual([['emote:clear', { owner: 'self' }]]);
     expect(sent(1)).toEqual([]);
   });
@@ -205,7 +202,7 @@ describe('OverlayManager remote and preview emotes', () => {
   it('shows a room member\'s emote on the target display with their tag, and clears theirs on the others', () => {
     mgr.spawnRemoteEmote({ displayId: 2, x: 5, y: 6, ref: 'gg_heart', peer: 'peer-1', tag: { name: 'Bob', color: 2 } });
     expect(resolveArt).toHaveBeenCalledWith('gg_heart', true);
-    expect(sent(1)).toEqual([['emote:spawn', { owner: 'peer-1', art: art('gg_heart', true), x: 5, y: 6, tag: { name: 'Bob', color: 2 } }]]);
+    expect(sent(1)).toEqual([['emote:spawn', { owner: 'peer-1', art: art('gg_heart', true), x: -17, y: 6, tag: { name: 'Bob', color: 2 } }]]);
     expect(sent(0)).toEqual([['emote:clear', { owner: 'peer-1' }]]);
   });
 
@@ -214,7 +211,7 @@ describe('OverlayManager remote and preview emotes', () => {
     mgr.on('sharedEmote', shared);
     mgr.previewEmote('nice');
     expect(resolveArt).toHaveBeenCalledWith('nice', false);
-    expect(sent(0)).toEqual([['emote:spawn', { owner: 'preview', art: art('nice', false), x: 960, y: 540 }]]);
+    expect(sent(0)).toEqual([['emote:spawn', { owner: 'preview', art: art('nice', false), x: 960, y: 519 }]]);
     expect(sent(1)).toEqual([]);
     expect(shared).not.toHaveBeenCalled();
   });

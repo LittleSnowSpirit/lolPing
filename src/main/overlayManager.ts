@@ -37,6 +37,8 @@ const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFin
 export class OverlayManager extends EventEmitter {
   readonly missingAssets = new Set<string>();
   private readonly windows = new Map<number, BrowserWindow>();
+  /** The visible window area within each display; Windows excludes the taskbar. */
+  private windowAreas = new Map<number, Display['bounds']>();
   private maps: DisplayMap[] = [];
   private numberedList: NumberedDisplay[] = [];
   private wheelDisplay: number | null = null;
@@ -56,14 +58,18 @@ export class OverlayManager extends EventEmitter {
       const p = raw as { id?: unknown; x?: unknown; y?: unknown } | null;
       if (!p || !isPingId(p.id) || !isNum(p.x) || !isNum(p.y)) return;
       const displayId = this.displayOf(event.sender);
-      if (displayId !== undefined) this.emit('shared', { id: p.id, displayId, x: p.x, y: p.y } satisfies SharedPing);
+      if (displayId !== undefined) {
+        const point = this.toDisplayPoint(displayId, p.x, p.y);
+        this.emit('shared', { id: p.id, displayId, ...point } satisfies SharedPing);
+      }
     });
     ipcMain.on(OVERLAY_EMOTED, (event, raw: unknown) => {
       const p = raw as { ref?: unknown; x?: unknown; y?: unknown } | null;
       if (!p || !isEmoteRefShape(p.ref) || !isNum(p.x) || !isNum(p.y)) return;
       const displayId = this.displayOf(event.sender);
       if (displayId === undefined) return;
-      this.emit('sharedEmote', { ref: p.ref, displayId, x: p.x, y: p.y } satisfies SharedEmote);
+      const point = this.toDisplayPoint(displayId, p.x, p.y);
+      this.emit('sharedEmote', { ref: p.ref, displayId, ...point } satisfies SharedEmote);
       // The wheel's own overlay already shows it. Another display may still hold an earlier one of ours.
       this.clearElsewhere(displayId, 'self');
     });
@@ -85,7 +91,7 @@ export class OverlayManager extends EventEmitter {
         if (!p) return;
         this.wheelDisplay = p.displayId;
         this.wheelKind = ev.wheel;
-        this.send(p.displayId, 'wheel:open', { x: p.x, y: p.y, wheel: ev.wheel });
+        this.send(p.displayId, 'wheel:open', { ...this.toWindowPoint(p.displayId, p.x, p.y), wheel: ev.wheel });
         break;
       }
       case 'wheelMove':
@@ -93,21 +99,24 @@ export class OverlayManager extends EventEmitter {
         if (this.wheelDisplay === null) return;
         const p = physicalToLocal(ev.x, ev.y, this.maps, this.wheelDisplay);
         if (!p) return;
-        this.send(p.displayId, ev.type === 'wheelMove' ? 'wheel:move' : 'wheel:release', { x: p.x, y: p.y, wheel: this.wheelKind });
+        this.send(p.displayId, ev.type === 'wheelMove' ? 'wheel:move' : 'wheel:release', {
+          ...this.toWindowPoint(p.displayId, p.x, p.y), wheel: this.wheelKind,
+        });
         if (ev.type === 'wheelRelease') this.wheelDisplay = null;
         break;
       }
       case 'click': {
         const p = physicalToLocal(ev.x, ev.y, this.maps);
         if (!p) break;
+        const point = this.toWindowPoint(p.displayId, p.x, p.y);
         if (ev.wheel === 'emote') {
           const ref = this.settings.clickEmoteId;
-          this.send(p.displayId, 'emote:spawn', { owner: 'self', art: this.resolveArt(ref, false), x: p.x, y: p.y });
+          this.send(p.displayId, 'emote:spawn', { owner: 'self', art: this.resolveArt(ref, false), ...point });
           this.clearElsewhere(p.displayId, 'self');
           this.emit('sharedEmote', { ref, displayId: p.displayId, x: p.x, y: p.y } satisfies SharedEmote);
           break;
         }
-        this.send(p.displayId, 'ping:spawn', { id: this.settings.clickPingId, x: p.x, y: p.y });
+        this.send(p.displayId, 'ping:spawn', { id: this.settings.clickPingId, ...point });
         this.emit('shared', { id: this.settings.clickPingId, displayId: p.displayId, x: p.x, y: p.y } satisfies SharedPing);
         break;
       }
@@ -121,23 +130,27 @@ export class OverlayManager extends EventEmitter {
 
   previewPing(id: PingId): void {
     const d = screen.getPrimaryDisplay();
-    this.send(d.id, 'ping:spawn', { id, x: d.bounds.width / 2, y: d.bounds.height / 2 });
+    const area = this.windowArea(d);
+    this.send(d.id, 'ping:spawn', { id, x: area.width / 2, y: area.height / 2 });
   }
 
   /** A room member's ping, already mapped onto one of our displays. */
   spawnRemote(p: { displayId: number; x: number; y: number; id: PingId; tag: PingTag }): void {
-    this.send(p.displayId, 'ping:spawn', { id: p.id, x: p.x, y: p.y, tag: p.tag });
+    this.send(p.displayId, 'ping:spawn', { id: p.id, ...this.toWindowPoint(p.displayId, p.x, p.y), tag: p.tag });
   }
 
   /** Shows an emote in the middle of the main display, without sharing it (the settings page's preview). */
   previewEmote(ref: EmoteRef): void {
     const d = screen.getPrimaryDisplay();
-    this.send(d.id, 'emote:spawn', { owner: 'preview', art: this.resolveArt(ref, false), x: d.bounds.width / 2, y: d.bounds.height / 2 });
+    const area = this.windowArea(d);
+    this.send(d.id, 'emote:spawn', { owner: 'preview', art: this.resolveArt(ref, false), x: area.width / 2, y: area.height / 2 });
   }
 
   /** A room member's emote, already mapped onto one of our displays. It replaces their earlier one, whichever display that was on. */
   spawnRemoteEmote(p: { displayId: number; x: number; y: number; ref: EmoteRef; peer: string; tag: PingTag }): void {
-    this.send(p.displayId, 'emote:spawn', { owner: p.peer, art: this.resolveArt(p.ref, true), x: p.x, y: p.y, tag: p.tag });
+    this.send(p.displayId, 'emote:spawn', {
+      owner: p.peer, art: this.resolveArt(p.ref, true), ...this.toWindowPoint(p.displayId, p.x, p.y), tag: p.tag,
+    });
     this.clearElsewhere(p.displayId, p.peer);
   }
 
@@ -153,6 +166,7 @@ export class OverlayManager extends EventEmitter {
   destroy(): void {
     for (const w of this.windows.values()) if (!w.isDestroyed()) w.destroy();
     this.windows.clear();
+    this.windowAreas.clear();
   }
 
   /** Dismisses a wheel that is on screen, if any. Also used when the helper stops: its cancel would never arrive. */
@@ -179,6 +193,7 @@ export class OverlayManager extends EventEmitter {
     this.maps = displays.map((d) => IS_MAC
       ? { id: d.id, dip: d.bounds, phys: d.bounds, scale: 1 }
       : { id: d.id, dip: d.bounds, phys: screen.dipToScreenRect(null, d.bounds), scale: d.scaleFactor });
+    this.windowAreas = new Map(displays.map((d) => [d.id, this.windowArea(d)]));
     this.numberedList = numberDisplays(displays, screen.getPrimaryDisplay().id);
     this.emit('displays', this.numberedList);
     for (const [id, win] of this.windows) {
@@ -190,30 +205,49 @@ export class OverlayManager extends EventEmitter {
     for (const d of displays) {
       const win = this.windows.get(d.id);
       if (win) {
-        win.setBounds(d.bounds);
-        this.setWindowShape(win, d);
+        win.setBounds(this.windowArea(d));
       }
       else this.windows.set(d.id, this.createWindow(d));
     }
   }
 
-  /** Keep the Windows overlay out of the taskbar's reserved area. */
-  private setWindowShape(win: BrowserWindow, d: Display): void {
-    if (IS_MAC) return;
-    const region = {
-      x: d.workArea.x - d.bounds.x,
-      y: d.workArea.y - d.bounds.y,
-      width: d.workArea.width,
-      height: d.workArea.height,
+  /** The actual Windows window must stop at the taskbar instead of relying on alpha-window clipping. */
+  private windowArea(d: Display): Display['bounds'] {
+    if (IS_MAC) return d.bounds;
+    // Leave a two-DIP guard where the work area meets reserved system UI. Windows can
+    // round the work-area and HWND edges differently at non-100% display scaling.
+    const guard = 2;
+    const left = d.workArea.x > d.bounds.x ? guard : 0;
+    const top = d.workArea.y > d.bounds.y ? guard : 0;
+    const right = d.workArea.x + d.workArea.width < d.bounds.x + d.bounds.width ? guard : 0;
+    const bottom = d.workArea.y + d.workArea.height < d.bounds.y + d.bounds.height ? guard : 0;
+    return {
+      x: d.workArea.x + left,
+      y: d.workArea.y + top,
+      width: Math.max(1, d.workArea.width - left - right),
+      height: Math.max(1, d.workArea.height - top - bottom),
     };
-    const coversDisplay = region.x === 0 && region.y === 0
-      && region.width === d.bounds.width && region.height === d.bounds.height;
-    win.setShape(coversDisplay ? [] : [region]);
+  }
+
+  /** Convert display-local CSS coordinates to the smaller window's local coordinates. */
+  private toWindowPoint(displayId: number, x: number, y: number): { x: number; y: number } {
+    const display = this.maps.find((m) => m.id === displayId);
+    const area = this.windowAreas.get(displayId);
+    if (!display || !area) return { x, y };
+    return { x: x - (area.x - display.dip.x), y: y - (area.y - display.dip.y) };
+  }
+
+  /** Convert a window-local point back to display-local coordinates for room sharing. */
+  private toDisplayPoint(displayId: number, x: number, y: number): { x: number; y: number } {
+    const display = this.maps.find((m) => m.id === displayId);
+    const area = this.windowAreas.get(displayId);
+    if (!display || !area) return { x, y };
+    return { x: x + (area.x - display.dip.x), y: y + (area.y - display.dip.y) };
   }
 
   private createWindow(d: Display): BrowserWindow {
     const win = new BrowserWindow({
-      ...d.bounds,
+      ...this.windowArea(d),
       transparent: true,
       backgroundColor: '#00000000',
       frame: false,
@@ -238,13 +272,12 @@ export class OverlayManager extends EventEmitter {
     });
     win.setIgnoreMouseEvents(true);
     win.setAlwaysOnTop(true, 'screen-saver');
-    this.setWindowShape(win, d);
     if (IS_MAC) win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
     win.webContents.on('did-finish-load', () => win.webContents.send('overlay:settings', this.settings));
     win.once('ready-to-show', () => {
       win.showInactive();
-      win.setBounds(d.bounds); // re-apply: mixed-DPI setups can size the first frame wrong
-      this.setWindowShape(win, d);
+      const current = screen.getAllDisplays().find((display) => display.id === d.id) ?? d;
+      win.setBounds(this.windowArea(current)); // re-apply: mixed-DPI setups can size the first frame wrong
     });
     void loadPage(win, 'overlay');
     return win;
